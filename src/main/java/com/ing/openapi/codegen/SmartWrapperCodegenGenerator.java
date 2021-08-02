@@ -22,7 +22,6 @@ import org.openapitools.codegen.CodegenSecurity;
 import org.openapitools.codegen.CodegenServer;
 import org.openapitools.codegen.CodegenServerVariable;
 import org.openapitools.codegen.CodegenType;
-import org.openapitools.codegen.IJsonSchemaValidationProperties;
 import org.openapitools.codegen.SupportingFile;
 import org.openapitools.codegen.api.TemplatingEngineAdapter;
 import org.openapitools.codegen.config.CodegenConfigurator;
@@ -34,7 +33,6 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -53,13 +51,18 @@ public class SmartWrapperCodegenGenerator implements CodegenConfig {
     private OpenAPI openAPI;
     private String inputSpec;
     private Map<String, Object> additionalProperties = new HashMap<>();
-    private boolean fitModelToAPI = true;
-    private List<CliOption> cliOptions = new ArrayList<CliOption>();
+    private final List<CliOption> cliOptions = new ArrayList<>();
 
     public SmartWrapperCodegenGenerator() {
         cliOptions.add(CliOption.newBoolean("fitModelToAPI",
                 "if NO modelsToGenerate is specified: should we fit the model classes only to the ones used by" +
                         "the subset of APIs we want to generate?", true));
+        cliOptions.add(CliOption.newString("operationsToGenerate",
+                "which operations of an API should be generated, empty means all. Defaults to empty"));
+        cliOptions.add(CliOption.newString("apisToGenerate",
+                "similar to the global property, but used here to avoid the limitations associated with it," +
+                        "namely: the global property is only set if generateApis is true and we don't always want that. " +
+                        "Defaults to empty"));
     }
 
     public CodegenConfig getWrappedConfig() {
@@ -73,6 +76,208 @@ public class SmartWrapperCodegenGenerator implements CodegenConfig {
             wrappedConfig.cliOptions().addAll(cliOptions);
         }
         return wrappedConfig;
+    }
+
+    @Override
+    public Map<String, Object> postProcessOperationsWithModels(Map<String, Object> objs, List<Object> allModels) {
+        Map<String, Object> delegateResult = getWrappedConfig().postProcessOperationsWithModels(objs, allModels);
+        Set<String> operationsToGenerate = getOperationsToGenerate();
+        if (!operationsToGenerate.isEmpty() && fitModelToAPI()) {
+            ((Map<String, Object>)delegateResult.get("operations")).entrySet().stream().forEach(entry -> {
+                if (entry.getKey().equals("operation")){
+                    List<CodegenOperation> opList = (List<CodegenOperation>) entry.getValue();
+                    List<CodegenOperation> filtered = opList.stream()
+                            .filter(op -> operationsToGenerate.contains(op.operationId))
+                            .collect(Collectors.toList());
+                    entry.setValue(filtered);
+                }
+            });
+            Set<String> modelNames = !allModels.isEmpty() ? allModels.stream()
+                    .map(m -> m instanceof Map ? ((Map)m).get("importPath").toString() : "")
+                    .collect(Collectors.toSet()) : usedModelsFromAPIs();
+            System.out.println("MODELS: " + modelNames);
+            System.out.println("ORG IMP: " + delegateResult.get("imports"));
+            List<Map<String,String>> filtered = ((List<Map<String,String>>)delegateResult.get("imports")).stream()
+//                    .map(s -> s.get("import"))
+                    .filter(imp -> modelNames.contains(imp.get("classname")))
+                    .collect(Collectors.toList());
+            System.out.println("FILTERED: " + filtered);
+            delegateResult.put("imports", filtered);
+        }
+
+        return delegateResult;
+    }
+
+    @Override
+    public Map<String, Object> postProcessAllModels(Map<String, Object> objs) {
+        Map<String, Object> filtered = objs;
+        if (fitModelToAPI()) {
+            Set<String> usedModels = usedModelsFromAPIs();
+            System.out.println(usedModels);
+            filtered = new HashMap<>();
+            filterOutNonUsedModels(objs, usedModels, filtered);
+        }
+        return getWrappedConfig().postProcessAllModels(filtered);
+    }
+
+    private void filterOutNonUsedModels(Map<String, Object> allObjs, Set<String> usedModels, Map<String, Object> acc) {
+        usedModels.forEach(modelName -> {
+            Object o = allObjs.get(modelName);
+            if (o != null) {
+                acc.put(modelName, o);
+                if (o instanceof Map) {
+                    addSubTree((Map<String, Object>) o, allObjs, acc);
+                }
+            }
+        });
+    }
+
+    private void addSubTree(Map<String, Object> currentObj, Map<String, Object> allObjs, Map<String, Object> acc) {
+        List<Map<String, Object>> importedModels = (List) currentObj.get("imports");
+        String modelPackage = (String) currentObj.get("package");
+        importedModels.stream().filter(modelMap -> modelMap.get("import").toString().startsWith(modelPackage)).forEach(modelMap -> {
+            String model = ((String) modelMap.get("import"));
+            String[] splittedName = model.split("\\.");
+            String baseName = splittedName[splittedName.length - 1];
+            Map<String, Object> nextObject = (Map<String, Object>) allObjs.get(baseName);
+            if (nextObject == null){
+                return;
+            }
+            if (!acc.containsKey(baseName)) {
+                acc.put(baseName, allObjs.get(baseName));
+                addSubTree(nextObject, allObjs, acc);
+            }
+        });
+    }
+
+    private Set<String> usedModelsFromAPIs() {
+        Map<String, List<CodegenOperation>> paths = processPaths(this.openAPI.getPaths());
+        final Set<String> apisToGenerate = getApisToGenerate();
+        Set<CodegenOperation> ops = paths.keySet().stream().filter(path -> apisToGenerate.isEmpty() || apisToGenerate.contains(path))
+                .map(paths::get).flatMap(Collection::stream).collect(Collectors.toSet());
+        Set<String> filteredOps = ops.stream().flatMap(cop -> cop.responses.stream()
+                .filter(resp -> resp.dataType != null && !resp.dataType.contains("<"))
+                .map(resp -> resp.dataType)).collect(Collectors.toSet());
+        filteredOps.addAll(ops.stream().flatMap(cop -> cop.bodyParams.stream()
+                .filter(req -> req.dataType != null && !req.dataType.contains("<"))
+                .map(req -> req.dataType)).collect(Collectors.toSet()));
+        return filteredOps;
+    }
+
+    private HashSet<String> getApisToGenerate() {
+        return Optional.ofNullable(GlobalSettings.getProperty(CodegenConstants.APIS))
+                .filter(s -> !s.isEmpty())
+                .map(apiNames -> new HashSet<>(Arrays.asList(apiNames.split(","))))
+                .orElse(Optional.ofNullable(additionalProperties().get("apisToGenerate"))
+                        .map(apisToGenerate -> new HashSet<>(Arrays.asList(apisToGenerate.toString().split(","))))
+                        .orElse(new HashSet<>()));
+    }
+
+    public Map<String, List<CodegenOperation>> processPaths(Paths paths) {
+        Map<String, List<CodegenOperation>> ops = new TreeMap<>();
+        // when input file is not valid and doesn't contain any paths
+        if (paths == null) {
+            return ops;
+        }
+        final Set<String> operationsToGenerate = getOperationsToGenerate();
+        for (String resourcePath : paths.keySet()) {
+            PathItem path = paths.get(resourcePath);
+            processOperation(resourcePath, "get", path.getGet(), ops, path, operationsToGenerate);
+            processOperation(resourcePath, "head", path.getHead(), ops, path, operationsToGenerate);
+            processOperation(resourcePath, "put", path.getPut(), ops, path, operationsToGenerate);
+            processOperation(resourcePath, "post", path.getPost(), ops, path, operationsToGenerate);
+            processOperation(resourcePath, "delete", path.getDelete(), ops, path, operationsToGenerate);
+            processOperation(resourcePath, "patch", path.getPatch(), ops, path, operationsToGenerate);
+            processOperation(resourcePath, "options", path.getOptions(), ops, path, operationsToGenerate);
+            processOperation(resourcePath, "trace", path.getTrace(), ops, path, operationsToGenerate);
+        }
+        return ops;
+    }
+
+    private Set<String> getOperationsToGenerate() {
+        final Set<String> operationsToGenerate = Optional.ofNullable(additionalProperties().get("operationsToGenerate"))
+                .filter(prop -> !prop.toString().isEmpty())
+                .map(prop -> new HashSet<>(Arrays.asList(prop.toString().split(","))))
+                .orElse(new HashSet<>());
+        System.out.println("OPS: " + operationsToGenerate);
+        return operationsToGenerate;
+    }
+
+    private boolean fitModelToAPI(){
+        return Optional.ofNullable(additionalProperties().get("fitModelToAPI")).map(a -> (Boolean)a)
+                .orElse(true);
+    }
+
+    private void processOperation(String resourcePath, String httpMethod, Operation operation,
+                                  Map<String, List<CodegenOperation>> operations, PathItem path,
+                                  Set<String> operationsToGenerate) {
+        if (operation == null){
+            return;
+        }
+
+        List<Tag> tags = new ArrayList<>();
+        List<String> tagNames = operation.getTags();
+        List<Tag> swaggerTags = openAPI.getTags();
+        if (tagNames != null) {
+            if (swaggerTags == null) {
+                for (String tagName : tagNames) {
+                    tags.add(new Tag().name(tagName));
+                }
+            } else {
+                for (String tagName : tagNames) {
+                    boolean foundTag = false;
+                    for (Tag tag : swaggerTags) {
+                        if (tag.getName().equals(tagName)) {
+                            tags.add(tag);
+                            foundTag = true;
+                            break;
+                        }
+                    }
+
+                    if (!foundTag) {
+                        tags.add(new Tag().name(tagName));
+                    }
+                }
+            }
+        }
+
+        if (tags.isEmpty()) {
+            tags.add(new Tag().name("default"));
+        }
+
+        /*
+         build up a set of parameter "ids" defined at the operation level
+         per the swagger 2.0 spec "A unique parameter is defined by a combination of a name and location"
+          i'm assuming "location" == "in"
+        */
+        Set<String> operationParameters = new HashSet<>();
+        if (operation.getParameters() != null) {
+            for (Parameter parameter : operation.getParameters()) {
+                operationParameters.add(generateParameterId(parameter));
+            }
+        }
+
+        //need to propagate path level down to the operation
+        if (path.getParameters() != null) {
+            for (Parameter parameter : path.getParameters()) {
+                //skip propagation if a parameter with the same name is already defined at the operation level
+                if (!operationParameters.contains(generateParameterId(parameter))) {
+                    operation.addParametersItem(parameter);
+                }
+            }
+        }
+
+        for (Tag tag : tags) {
+            CodegenOperation codegenOperation = this.fromOperation(resourcePath, httpMethod, operation, path.getServers());
+            codegenOperation.tags = new ArrayList<>(tags);
+            if (operationsToGenerate.isEmpty() || operationsToGenerate.contains(codegenOperation.operationId)) {
+                this.addOperationToGroup(this.sanitizeTag(tag.getName()), resourcePath, operation, codegenOperation, operations);
+            }
+        }
+    }
+
+    private static String generateParameterId(Parameter parameter) {
+        return parameter.getName() + ":" + parameter.getIn();
     }
 
     @Override
@@ -459,24 +664,6 @@ public class SmartWrapperCodegenGenerator implements CodegenConfig {
     }
 
     @Override
-    public Map<String, Object> postProcessOperationsWithModels(Map<String, Object> objs, List<Object> allModels) {
-        Map<String, Object> delegateResult = getWrappedConfig().postProcessOperationsWithModels(objs, allModels);
-        Set<String> operationsToGenerate = getOperationsToGenerate();
-        if (!operationsToGenerate.isEmpty()) {
-            ((Map<String, Object>)delegateResult.get("operations")).entrySet().stream().forEach(entry -> {
-                if (entry.getKey().equals("operation")){
-                    List<CodegenOperation> opList = (List<CodegenOperation>) entry.getValue();
-                    List<CodegenOperation> filtered = opList.stream()
-                            .filter(op -> operationsToGenerate.contains(op.operationId)).collect(Collectors.toList());
-                    entry.setValue(filtered);
-                }
-            });
-        }
-
-        return delegateResult;
-    }
-
-    @Override
     public Map<String, Object> postProcessSupportingFileData(Map<String, Object> objs) {
         return getWrappedConfig().postProcessSupportingFileData(objs);
     }
@@ -730,190 +917,5 @@ public class SmartWrapperCodegenGenerator implements CodegenConfig {
     @Override
     public Schema unaliasSchema(Schema schema, Map<String, String> usedImportMappings) {
         return getWrappedConfig().unaliasSchema(schema, usedImportMappings);
-    }
-
-    @Override
-    public Map<String, Object> postProcessAllModels(Map<String, Object> objs) {
-        Map<String, Object> filtered = objs;
-        if (fitModelToAPI) {
-            Set<String> usedModels = usedModelsFromAPIs();
-            filtered = new HashMap<>();
-            filterOutNonUsedModels(objs, usedModels, filtered);
-        }
-        return getWrappedConfig().postProcessAllModels(filtered);
-    }
-
-    private Map<String, Object> filterOutNonUsedModels(Map<String, Object> allObjs, Set<String> usedModels, Map<String, Object> acc) {
-        usedModels.forEach(modelName -> {
-            Object o = allObjs.get(modelName);
-            if (o != null) {
-                acc.put(modelName, o);
-                if (o instanceof Map) {
-                    addSubTree((Map<String, Object>) o, allObjs, acc);
-                }
-            }
-        });
-
-        return acc;
-    }
-
-    private void addSubTree(Map<String, Object> currentObj, Map<String, Object> allObjs, Map<String, Object> acc) {
-        List<Map<String, Object>> importedModels = (List) currentObj.get("imports");
-        String modelPackage = (String) currentObj.get("package");
-        importedModels.stream().filter(modelMap -> modelMap.get("import").toString().startsWith(modelPackage)).forEach(modelMap -> {
-            String model = ((String) modelMap.get("import"));
-            String[] splittedName = model.split("\\.");
-            String baseName = splittedName[splittedName.length - 1];
-            Map<String, Object> nextObject = (Map<String, Object>) allObjs.get(baseName);
-            if (nextObject == null){
-                return;
-            }
-            if (!acc.containsKey(baseName)) {
-                acc.put(baseName, allObjs.get(baseName));
-                addSubTree(nextObject, allObjs, acc);
-            }
-        });
-    }
-
-    private Set<String> usedModelsFromAPIs() {
-        Map<String, List<CodegenOperation>> paths = processPaths(this.openAPI.getPaths());
-        final Set<String> apisToGenerate = Optional.ofNullable(GlobalSettings.getProperty("apis")).filter(String::isEmpty)
-                .map(apiNames -> new HashSet<>(Arrays.asList(apiNames.split(","))))
-                .orElse(new HashSet<>());
-//        Set<String> usedModels = new HashSet<>();
-        Set<CodegenOperation> ops = paths.keySet().stream().filter(path -> apisToGenerate.isEmpty() || apisToGenerate.contains(path))
-                .map(paths::get).flatMap(Collection::stream).collect(Collectors.toSet());
-        Set<String> filteredOps = ops.stream().flatMap(cop -> cop.responses.stream()
-                        .filter(resp -> resp.dataType != null && !resp.dataType.contains("<"))
-                            .map(resp -> resp.dataType)).collect(Collectors.toSet());
-        filteredOps.addAll(ops.stream().flatMap(cop -> cop.bodyParams.stream()
-                .filter(req -> req.dataType != null && !req.dataType.contains("<"))
-                .map(req -> req.dataType)).collect(Collectors.toSet()));
-        return filteredOps;
-//        a.addAll(cop.bodyParams.stream().filter(req -> req.dataType != null && !req.dataType.contains("<"))
-//                .map(req -> req.dataType).collect(Collectors.toSet()));
-//        if (apisToGenerate != null && !apisToGenerate.isEmpty()) {
-//            for (String m : paths.keySet()) {
-//                if (apisToGenerate.contains(m)) {
-//                    paths.get(m).forEach(cop -> {
-//                        usedModels.addAll(cop.responses.stream().filter(resp -> resp.dataType != null && !resp.dataType.contains("<"))
-//                                .map(resp -> resp.dataType).collect(Collectors.toSet()));
-//                        usedModels.addAll(cop.bodyParams.stream().filter(resp -> resp.dataType != null && !resp.dataType.contains("<"))
-//                                .map(par -> par.dataType).collect(Collectors.toSet()));
-//                    });
-//                }
-//            }
-//        } else {
-//            paths.keySet().forEach(pathKey -> {
-//                paths.get(pathKey).forEach(cop -> {
-//                    usedModels.addAll(cop.responses.stream().filter(resp -> resp.dataType != null && !resp.dataType.contains("<"))
-//                            .map(resp -> resp.dataType).collect(Collectors.toSet()));
-//                    usedModels.addAll(cop.bodyParams.stream().filter(resp -> resp.dataType != null && !resp.dataType.contains("<"))
-//                            .map(par -> par.dataType).collect(Collectors.toSet()));
-//                });
-//            });
-//        }
-
-    }
-
-    public Map<String, List<CodegenOperation>> processPaths(Paths paths) {
-        Map<String, List<CodegenOperation>> ops = new TreeMap<>();
-        // when input file is not valid and doesn't contain any paths
-        if (paths == null) {
-            return ops;
-        }
-        final Set<String> operationsToGenerate = getOperationsToGenerate();
-        for (String resourcePath : paths.keySet()) {
-            PathItem path = paths.get(resourcePath);
-            processOperation(resourcePath, "get", path.getGet(), ops, path, operationsToGenerate);
-            processOperation(resourcePath, "head", path.getHead(), ops, path, operationsToGenerate);
-            processOperation(resourcePath, "put", path.getPut(), ops, path, operationsToGenerate);
-            processOperation(resourcePath, "post", path.getPost(), ops, path, operationsToGenerate);
-            processOperation(resourcePath, "delete", path.getDelete(), ops, path, operationsToGenerate);
-            processOperation(resourcePath, "patch", path.getPatch(), ops, path, operationsToGenerate);
-            processOperation(resourcePath, "options", path.getOptions(), ops, path, operationsToGenerate);
-            processOperation(resourcePath, "trace", path.getTrace(), ops, path, operationsToGenerate);
-        }
-        return ops;
-    }
-
-    private Set<String> getOperationsToGenerate() {
-        final Set<String> operationsToGenerate = Optional.ofNullable(additionalProperties().get("operationsToGenerate"))
-                .filter(prop -> !prop.toString().isEmpty())
-                .map(prop -> new HashSet<>(Arrays.asList(prop.toString().split(","))))
-                .orElse(new HashSet<>());
-        return operationsToGenerate;
-    }
-
-    private void processOperation(String resourcePath, String httpMethod, Operation operation,
-                                  Map<String, List<CodegenOperation>> operations, PathItem path,
-                                  Set<String> operationsToGenerate) {
-        if (operation == null){
-            return;
-        }
-
-        List<Tag> tags = new ArrayList<>();
-        List<String> tagNames = operation.getTags();
-        List<Tag> swaggerTags = openAPI.getTags();
-        if (tagNames != null) {
-            if (swaggerTags == null) {
-                for (String tagName : tagNames) {
-                    tags.add(new Tag().name(tagName));
-                }
-            } else {
-                for (String tagName : tagNames) {
-                    boolean foundTag = false;
-                    for (Tag tag : swaggerTags) {
-                        if (tag.getName().equals(tagName)) {
-                            tags.add(tag);
-                            foundTag = true;
-                            break;
-                        }
-                    }
-
-                    if (!foundTag) {
-                        tags.add(new Tag().name(tagName));
-                    }
-                }
-            }
-        }
-
-        if (tags.isEmpty()) {
-            tags.add(new Tag().name("default"));
-        }
-
-        /*
-         build up a set of parameter "ids" defined at the operation level
-         per the swagger 2.0 spec "A unique parameter is defined by a combination of a name and location"
-          i'm assuming "location" == "in"
-        */
-        Set<String> operationParameters = new HashSet<>();
-        if (operation.getParameters() != null) {
-            for (Parameter parameter : operation.getParameters()) {
-                operationParameters.add(generateParameterId(parameter));
-            }
-        }
-
-        //need to propagate path level down to the operation
-        if (path.getParameters() != null) {
-            for (Parameter parameter : path.getParameters()) {
-                //skip propagation if a parameter with the same name is already defined at the operation level
-                if (!operationParameters.contains(generateParameterId(parameter))) {
-                    operation.addParametersItem(parameter);
-                }
-            }
-        }
-
-        for (Tag tag : tags) {
-            CodegenOperation codegenOperation = this.fromOperation(resourcePath, httpMethod, operation, path.getServers());
-            codegenOperation.tags = new ArrayList<>(tags);
-            if (operationsToGenerate.isEmpty() || operationsToGenerate.contains(codegenOperation.operationId)) {
-                this.addOperationToGroup(this.sanitizeTag(tag.getName()), resourcePath, operation, codegenOperation, operations);
-            }
-        }
-    }
-
-    private static String generateParameterId(Parameter parameter) {
-        return parameter.getName() + ":" + parameter.getIn();
     }
 }
